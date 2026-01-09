@@ -31,6 +31,7 @@
 // "Users  that  use  “status  bit”  polling  should  select  a  frequency  slower  than  20%  more  than  the  update  time."
 // delay count in milliseconds
 // 100 KHz (standard i2c) = 100000 read / sec, 100 read/millisecond
+// specification says "Users that use “status bit” polling should select a frequency slower than 20% more than the update time."
 // theoretically, 1 read / ms would be just enough, so delay(1)
 // update time: 
 #define I2CPOLLWAIT 100*1.2
@@ -92,6 +93,11 @@ unsigned long now = millis();
  */
 uint8_t tca4307_ready = 12; // purple
 uint8_t tca4307_enable = 13; // gray
+
+/*
+ * hard reset
+ */
+uint8_t resetPin = 9; // color
 
 /*
  * Other variables
@@ -157,7 +163,16 @@ char * int2bin(uint8_t x) {
 
 // declare reset function at address 0
 // calling this trigger a *soft* reset
-void(* resetFunc) (void) = 0;
+void(* softResetFunc) (void) = 0;
+
+
+// declare reset function
+// calling this trigger a *hard* reset
+void hardResetFunc() {
+  Serial.println(F("Hard Resetting as requested"));
+  digitalWrite(resetPin, LOW);
+  // Arduino will hard reset at this point
+}
 
 
 // rounds a number to 2 decimal places
@@ -181,15 +196,16 @@ byte initializeEthernet() {
       Serial.println(F("Ethernet cable not connected"));
     }
 
+    // Enforce a full reset if the DHCP is not properly initialized
     delay(5000);
-    resetFunc();
+    softResetFunc();
   }
   Serial.println(F("DHCP init OK"));
   // assign value to the global value that give me current status
   if ( checkDhcp() == false ) {
     Serial.println(F("DHCP config failed"));
     delay(1000);
-    resetFunc();
+    softResetFunc();
   }
   ipObtained=true;
   // dhcp test end
@@ -330,6 +346,7 @@ byte MQTTSend() {
  * HIGH: VCC
  */
 void tca4307Reset() {
+  // WARNING: NOT WORKING as intended, VCC and GND remain connected
   // disable i2c
   Serial.println(F("tca4307Reset: disable i2c"));
   Serial.print(F("tca4307Reset: pin"));
@@ -352,7 +369,7 @@ uint8_t resetStale() {
   Wire.beginTransmission((uint8_t) M32Address);
   byteread = Wire.endTransmission();
   if(byteread != 0x00) {
-    Serial.println(F("Missing i2c device. Sleeping 1s and resetting i2c through tca430"));
+    Serial.println(F("Missing i2c device. Sleeping 1s and resetting i2c through tca4307"));
     Serial.flush();
     // TODO reset i2c bus with EN pindisable 
     tca4307Reset();
@@ -402,6 +419,10 @@ byte fetch_i2cdata() {
   tca4307_status = digitalRead(tca4307_ready);
   Serial.print(F("tca4307 readiness: "));
   Serial.println(tca4307_status);
+  if(tca4307_status != true) {
+    Serial.println(F("i2c bus not ready, skipping the read"));
+    return 1;
+  }
 
   Serial.print(F("**Loop** Reading from i2c bus on device address: "));
   Serial.println((uint8_t) M32Address);
@@ -427,18 +448,15 @@ byte fetch_i2cdata() {
 
   // the buffersize is 4, therefore we need to read from Wire 4 times
   // rawdata[] is needed to print out the data afterward
+  // POLLWAIT not needed as the bytes are already stored
   Serial.println(F("reading buffered i2c byte 1/4"));
-  //delay(I2CPOLLWAIT);
   rawdata[0] = Wire.read();
   //DEBUG Serial.println(rawdata[0]);
   Serial.println(F("reading buffered i2c byte 2/4"));
-  //delay(I2CPOLLWAIT);
   rawdata[1] = Wire.read();
   Serial.println(F("reading buffered i2c byte 3/4"));
-  //delay(I2CPOLLWAIT);
   rawdata[2] = Wire.read();
   Serial.println(F("reading buffered i2c byte 4/4"));
-  //delay(I2CPOLLWAIT);
   rawdata[3] = Wire.read();
 
   // as the variable Press_H/L, Temp_H/L were meant to be modified, have to save the rawdata into another variable
@@ -484,6 +502,12 @@ byte fetch_i2cdata() {
       Serial.println(F("M32 i2c data error 11: Error"));
       // TODO should be a power reset needed at this point?
       //resetStale();
+      // ground must be removed
+      // LTC4311 does not remove VCC and/or GND
+      Serial.println(F("Error on M32, unable to restore if not fully disconnected - GND disconnection is OK -testin LTC4311 enable pin"));
+      Serial.flush();
+      //hardResetFunc();
+      // does not disconnect the wire, not sufficient
       tca4307Reset();
       break;
   }
@@ -553,14 +577,19 @@ byte fetch_i2cdata() {
 void setup() {
   // initialize tca4307
   pinMode(tca4307_enable, OUTPUT);  // sets the pin of the "enable" as output
-  pinMode(tca4307_ready, INPUT);    // sets the pin of the readiness as input
+  pinMode(tca4307_ready, INPUT_PULLUP);    // sets the pin of the readiness as input. As by datasheet, it requires 10k pullup
   tca4307Reset();
-  //digitalWrite(tca4307_enable, HIGH);
-  // Debug pin
-  pinMode(11, OUTPUT);  // sets the pin of the "enable" as output
-  pinMode(10, OUTPUT);  // sets the pin of the "enable" as output
-  digitalWrite(10, HIGH);
-  digitalWrite(11, LOW);
+
+  // Debug pin, to be used manually
+  pinMode(7, OUTPUT);  // sets the pin of the "enable" as output
+  pinMode(8, OUTPUT);  // sets the pin of the "enable" as output
+  digitalWrite(7, HIGH);
+  digitalWrite(8, LOW);
+
+  // Setup the reset pin. First setup the output value, then set the output mode - otherwise reset continuously
+  digitalWrite(resetPin, HIGH);
+  delay(200); // failsafe
+  pinMode(resetPin, OUTPUT);
 
   // Initialize (pin used) the boot of ethernet
   Ethernet.init(10);  // Most Arduino shields
@@ -628,9 +657,6 @@ void loop()
   Serial.print(F("\r\n\nuptime: "));
   Serial.println(now);
 
-  // reset the watchdog at the start of the loop
-  WDT.refresh();
-
   // get updated data from the sensor
   // if return != 0, i2c failed (not anymore the original scope for the variable)
   if ( fetch_i2cdata() != 0 ) {
@@ -639,6 +665,11 @@ void loop()
 
   // function return not parsed
   MQTTSend();
+
+  // reset the watchdog at the end of the loop
+  // rationale: if the previous functions fails WDT must come in function
+  WDT.refresh();
+
   //delay(1000-RUNTIME);
   // TODO Fix the code?
   delay(2000);
